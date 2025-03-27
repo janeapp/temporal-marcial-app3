@@ -20,45 +20,114 @@ permissions:
   contents: write
 
 jobs:
-  build:
-    if: github.ref == 'refs/heads/main' # running for "main" only
-    name: "build docker image"
-    uses: janeapp/ghw-build-and-push-eks/.github/workflows/workflow.yaml@v1
-    secrets: inherit
-    with:
-      environment: EKS-Dev
-      level: ${{ inputs.level }}
-      use_branch: false
-
-  push-to-staging: # this has unstable and staging argos
-    name: "push image to staging ECR"
+  build-and-deploy:
     runs-on: ubuntu-latest
-    needs: build
-    environment: EKS-Dev
     steps:
-      - name: push to staging
-        uses: janeapp/gha-push-image@v0
+      - name: Checkout code
+        uses: actions/checkout@v4
         with:
-          image_tag: ${{ needs.build.outputs.tag }}
-          gh_actor: ${{ github.actor }}
-          gh_token: ${{ secrets.GITHUB_TOKEN }}
-          aws_role: ${{ vars.AWS_ROLE }}
-          aws_region: ${{ vars.AWS_REGION }}
-          aws_registry: ${{ vars.REGISTRY }}
+          fetch-depth: 0 # https://github.com/actions/checkout/issues/1471 https://github.com/actions/checkout/issues/1467
+          fetch-tags: true
 
-  staging-deploy-pr:
-    name: "pr to deploy to STAGING"
-    runs-on: ubuntu-latest
-    needs: [push-to-staging, build]
-
-    steps:
-      - name: echo tag
-        run: echo ${{ needs.build.outputs.tag }}
-      - name: open config PR
-        uses: janeapp/gha-open-config-pull-request@v0
+      - name: Generate token
+        id: app_token
+        uses: actions/create-github-app-token@v1
         with:
-          environment: staging
-          image-tag: ${{ needs.build.outputs.tag }}
           app-id: ${{ vars.AUTOMATION_UPDATER_APP_ID }}
-          app-private-key: ${{ secrets.AUTOMATION_UPDATER_APP_PRIVATE_KEY }}
-          config-repo: ${{ vars.CONFIG_REPO }}
+          private-key: ${{ secrets.AUTOMATION_UPDATER_APP_PRIVATE_KEY }}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (tags, labels) for Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ghcr.io/${{ github.repository }}
+          tags: |
+            type=sha,format=long,prefix=
+          flavor:
+            latest=false
+
+      - name: Build and push Docker image
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          provenance: false
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: |
+            ${{ steps.meta.outputs.labels }}
+            app.jane.commit.user=${{ github.actor }}
+            app.jane.commit.branch=${{ github.head_ref || github.ref_name }}
+            ghcr.io/${{ github.repository }}:${{ github.sha }}
+          cache-to: type=gha,mode=max
+          cache-from: type=gha
+          secrets: |
+            GITHUB_TOKEN=${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.aws_role }}
+          aws-region: ${{ vars.aws_region }}
+
+      - name: Login to ECR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ vars.aws_registry }}
+
+      - uses: imjasonh/setup-crane@00c9e93efa4e1138c9a7a5c594acd6c75a2fbf0c
+      - name: push from gchr to staging
+        env:
+          GH_TOKEN: ${{ inputs.gh_token }}
+        run: |
+          crane copy ghcr.io/${{ github.repository }}:${{ github.sha }} ${{ vars.aws_registry }}:${{ github.sha }}
+
+
+      # open pr on config repo
+      # - name: Generate an App token
+      #   id: pr_token
+      #   uses: actions/create-github-app-token@v1
+      #   with:
+      #     app-id: ${{ vars.AUTOMATION_UPDATER_APP_ID }}
+      #     private-key: ${{ secrets.AUTOMATION_UPDATER_APP_PRIVATE_KEY }}
+      #     repositories: $SERVICE_NAME-config
+      #
+      # - name: Checkout repository
+      #   uses: actions/checkout@v4
+      #   with:
+      #     repository: janeapp/$SERVICE_NAME-config
+      #     ref: main
+      #     token: ${{ steps.pr_token.outputs.token }}
+      #     path: config
+      #
+      # - name: update image tag
+      #   run: |
+      #       yq eval '.global.image.repository = "${{ vars.aws_registry }}"' -i config/deployed-version.yaml
+      #       yq eval '.global.image.tag = "${{ github.sha }}"' -i config/deployed-version.yaml
+      #       cat config/deployed-version.yaml
+      #
+      # - name: commit and push
+      #   run: |
+      #       cd config
+      #       git config --global user.email ${{ vars.AUTOMATION_UPDATER_AUTHOR_EMAIL }}
+      #       git config --global user.name "${{ vars.AUTOMATION_UPDATER_AUTHOR_NAME }}"
+      #       git add deployed-version.yaml
+      #       git commit -m 'update image tag: ${{ github.sha }}'
+      #       git push
+      #   env:
+      #     GH_TOKEN: ${{ steps.pr_token.outputs.token }}
