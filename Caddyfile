@@ -1,0 +1,28 @@
+{
+    # Global options
+    admin off
+    auto_https off
+}
+
+:80, :443 {
+    # Set this path to your site's directory
+    root * /usr/share/caddy
+
+    # Enable the static file server
+    file_server
+
+    # Enable compression
+    encode gzip
+
+    # Add security headers
+    header {
+        # Enable HSTS
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        # Disable clients from sniffing the media type
+        X-Content-Type-Options "nosniff"
+        # Keep referrer data off of HTTP connections
+        Referrer-Policy "strict-origin-when-cross-origin"
+        # Enable cross-site filter (XSS)
+        X-XSS-Protection "1; mode=block"
+    }
+}
